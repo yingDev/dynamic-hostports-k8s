@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -58,52 +59,29 @@ func podPortToServiceName(pod *v1.Pod, requestedPort int32) string {
 	return pod.Name + "-" + strconv.Itoa(int(requestedPort))
 }
 
-func createService(client *kubernetes.Clientset, pod *v1.Pod, requestedPort int32, cachedExternalIPs map[string]string) error {
-	if pod.Annotations[podPortToAnnotation(requestedPort)] != "" {
-		log.Printf("[%s] Pod already has service annotation for port %d. Skipping recreation.", pod.Name, requestedPort)
-		return nil
-	}
-	log.Printf("[%s] Create service for port %d", pod.Name, requestedPort)
-
-	serviceName := podPortToServiceName(pod, requestedPort)
-
-	meta := metav1.ObjectMeta{
-		Name:      serviceName,
-		Namespace: pod.Namespace,
-		Labels: map[string]string{
-			managedByLabelKey: managedByLabelValue,
-			forPodLabelKey:    pod.Name,
-		},
-	}
-
-	_, err := client.CoreV1().Endpoints(pod.Namespace).Create(
-		context.Background(),
-		&v1.Endpoints{
-			ObjectMeta: meta,
-			Subsets: []v1.EndpointSubset{
-				{
-					Addresses: []v1.EndpointAddress{
-						{
-							IP: pod.Status.PodIP,
-						},
+func endpointDefinition(meta metav1.ObjectMeta, pod *v1.Pod, requestedPort int32) *v1.Endpoints {
+	return &v1.Endpoints{
+		ObjectMeta: meta,
+		Subsets: []v1.EndpointSubset{
+			{
+				Addresses: []v1.EndpointAddress{
+					{
+						IP: pod.Status.PodIP,
 					},
-					Ports: []v1.EndpointPort{
-						{
-							Port: requestedPort,
-							// Protocol: TODO: Detect the type of port of the port and then use TCP/UDP
-						},
+				},
+				Ports: []v1.EndpointPort{
+					{
+						Port: requestedPort,
+						// Protocol: TODO: Detect the type of port of the port and then use TCP/UDP
 					},
 				},
 			},
 		},
-		metav1.CreateOptions{},
-	)
-
-	if err != nil {
-		return err
 	}
+}
 
-	serviceDef := v1.Service{
+func serviceDefinition(client *kubernetes.Clientset, meta metav1.ObjectMeta, pod *v1.Pod, requestedPort int32, cachedExternalIPs map[string]string) *v1.Service {
+	serviceDef := &v1.Service{
 		ObjectMeta: meta,
 		Spec: v1.ServiceSpec{
 			Type: v1.ServiceTypeNodePort,
@@ -126,11 +104,93 @@ func createService(client *kubernetes.Clientset, pod *v1.Pod, requestedPort int3
 		log.Printf("[%s] Got no ip of node '%s' are you using minikube? The service will exposed over all nodes.", pod.Name, pod.Spec.NodeName)
 	}
 
-	newService, err := client.CoreV1().Services(pod.Namespace).Create(
+	return serviceDef
+}
+
+func ensureEndpoints(client *kubernetes.Clientset, meta metav1.ObjectMeta, pod *v1.Pod, requestedPort int32) error {
+	desired := endpointDefinition(meta, pod, requestedPort)
+	_, err := client.CoreV1().Endpoints(pod.Namespace).Create(
 		context.Background(),
-		&serviceDef,
+		desired,
 		metav1.CreateOptions{},
 	)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+
+	existing, err := client.CoreV1().Endpoints(pod.Namespace).Get(context.Background(), meta.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	existing.Labels = desired.Labels
+	existing.Subsets = desired.Subsets
+	_, err = client.CoreV1().Endpoints(pod.Namespace).Update(context.Background(), existing, metav1.UpdateOptions{})
+	return err
+}
+
+func ensureService(client *kubernetes.Clientset, meta metav1.ObjectMeta, pod *v1.Pod, requestedPort int32, cachedExternalIPs map[string]string) (*v1.Service, error) {
+	desired := serviceDefinition(client, meta, pod, requestedPort, cachedExternalIPs)
+	newService, err := client.CoreV1().Services(pod.Namespace).Create(
+		context.Background(),
+		desired,
+		metav1.CreateOptions{},
+	)
+	if err == nil {
+		return newService, nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return nil, err
+	}
+
+	existing, err := client.CoreV1().Services(pod.Namespace).Get(context.Background(), meta.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if len(existing.Spec.Ports) == 0 {
+		return nil, errors.New("existing service has no ports")
+	}
+
+	existing.Labels = desired.Labels
+	existing.Spec.Type = desired.Spec.Type
+	existing.Spec.ExternalIPs = desired.Spec.ExternalIPs
+	existing.Spec.Ports[0].Port = desired.Spec.Ports[0].Port
+	existing.Spec.Ports[0].TargetPort = desired.Spec.Ports[0].TargetPort
+	_, err = client.CoreV1().Services(pod.Namespace).Update(context.Background(), existing, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return existing, nil
+}
+
+func reconcileService(client *kubernetes.Clientset, pod *v1.Pod, requestedPort int32, cachedExternalIPs map[string]string) error {
+	if pod.Annotations[podPortToAnnotation(requestedPort)] != "" {
+		log.Printf("[%s] Pod already has service annotation for port %d. Skipping recreation.", pod.Name, requestedPort)
+		return nil
+	}
+	log.Printf("[%s] Reconcile service for port %d", pod.Name, requestedPort)
+
+	serviceName := podPortToServiceName(pod, requestedPort)
+
+	meta := metav1.ObjectMeta{
+		Name:      serviceName,
+		Namespace: pod.Namespace,
+		Labels: map[string]string{
+			managedByLabelKey: managedByLabelValue,
+			forPodLabelKey:    pod.Name,
+		},
+	}
+
+	err := ensureEndpoints(client, meta, pod, requestedPort)
+	if err != nil {
+		return err
+	}
+
+	newService, err := ensureService(client, meta, pod, requestedPort, cachedExternalIPs)
 	if err != nil {
 		return err
 	}
@@ -192,7 +252,19 @@ func addPodPortAnnotation(client *kubernetes.Clientset, pod *v1.Pod, requestedPo
 }
 
 func deleteService(client *kubernetes.Clientset, namespace string, serviceName string) error {
-	return client.CoreV1().Services(namespace).Delete(context.Background(), serviceName, metav1.DeleteOptions{})
+	err := client.CoreV1().Services(namespace).Delete(context.Background(), serviceName, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+func deleteEndpoint(client *kubernetes.Clientset, namespace string, endpointName string) error {
+	err := client.CoreV1().Endpoints(namespace).Delete(context.Background(), endpointName, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 func deletePodServices(client *kubernetes.Clientset, pod *v1.Pod) error {
@@ -204,6 +276,12 @@ func deletePodServices(client *kubernetes.Clientset, pod *v1.Pod) error {
 	for _, requestedPort := range requestedPorts {
 		log.Printf("[%s] Deleting service for port %d.", pod.Name, requestedPort)
 		err := deleteService(client, pod.Namespace, podPortToServiceName(pod, requestedPort))
+		if err != nil {
+			return err
+		}
+
+		log.Printf("[%s] Deleting endpoint for port %d.", pod.Name, requestedPort)
+		err = deleteEndpoint(client, pod.Namespace, podPortToServiceName(pod, requestedPort))
 		if err != nil {
 			return err
 		}
@@ -241,14 +319,14 @@ func handlePodEvent(client *kubernetes.Clientset, eventType watch.EventType, pod
 			return err
 		}
 
-		handledPods[namespacedPodName] = true
-
 		for _, requestedPort := range requestedPorts {
-			err := createService(client, pod, requestedPort, cachedExternalIPs)
+			err := reconcileService(client, pod, requestedPort, cachedExternalIPs)
 			if err != nil {
 				return err
 			}
 		}
+
+		handledPods[namespacedPodName] = true
 	}
 
 	return nil
@@ -283,10 +361,13 @@ func podManagerRoutine(client *kubernetes.Clientset, namespace string) {
 	}
 }
 
-func deleteStaleServices(client *kubernetes.Clientset, namespace string) error {
+func deleteStaleResources(client *kubernetes.Clientset, namespace string) error {
 	pods, err := client.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector: labelKey,
 	})
+	if err != nil {
+		return err
+	}
 
 	services, err := client.CoreV1().Services(namespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector: managedByLabelKey + "=" + managedByLabelValue,
@@ -295,17 +376,21 @@ func deleteStaleServices(client *kubernetes.Clientset, namespace string) error {
 		return err
 	}
 
+	endpoints, err := client.CoreV1().Endpoints(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: managedByLabelKey + "=" + managedByLabelValue,
+	})
+	if err != nil {
+		return err
+	}
+
+	knownPods := make(map[string]bool, len(pods.Items))
+	for _, pod := range pods.Items {
+		knownPods[pod.Namespace+"/"+pod.Name] = true
+	}
+
 	for _, service := range services.Items {
 		forPod := service.Labels[forPodLabelKey]
-
-		foundPod := false
-		for _, pod := range pods.Items {
-			if pod.Name == forPod && pod.Namespace == service.Namespace {
-				foundPod = true
-				break
-			}
-		}
-		if !foundPod {
+		if !knownPods[service.Namespace+"/"+forPod] {
 			log.Printf("Delete stale service '%s'", service.Name)
 			localErr := deleteService(client, service.Namespace, service.Name)
 			if localErr != nil {
@@ -314,13 +399,24 @@ func deleteStaleServices(client *kubernetes.Clientset, namespace string) error {
 		}
 	}
 
+	for _, endpoint := range endpoints.Items {
+		forPod := endpoint.Labels[forPodLabelKey]
+		if !knownPods[endpoint.Namespace+"/"+forPod] {
+			log.Printf("Delete stale endpoint '%s'", endpoint.Name)
+			localErr := deleteEndpoint(client, endpoint.Namespace, endpoint.Name)
+			if localErr != nil {
+				logErr.Printf("Failed to delete endpoint %s", localErr)
+			}
+		}
+	}
+
 	return nil
 }
 
 func serviceManagerRoutine(client *kubernetes.Clientset, namespace string) {
-	err := deleteStaleServices(client, namespace)
+	err := deleteStaleResources(client, namespace)
 	if err != nil {
-		logErr.Panicf("Error while deleting stale services %s", err)
+		logErr.Panicf("Error while deleting stale resources %s", err)
 	}
 }
 

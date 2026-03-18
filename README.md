@@ -17,6 +17,44 @@ kubectl apply -f https://raw.githubusercontent.com/0blu/dynamic-hostports-k8s/ma
 
 If you want, you can also modify this file and use the `KUBERNETES_NAMESPACE` environment variable to limit the access.
 
+Helm
+``` bash
+helm upgrade --install dynamic-hostports . \
+  --namespace dynamic-hostports \
+  --create-namespace \
+  --set-string image=0blu/dynamic-hostport-manager:latest
+```
+
+The chart uses the Helm release namespace instead of creating a fixed `dynamic-hostports` namespace resource.
+
+Image is a required single string value:
+
+``` yaml
+image: ""
+imagePullPolicy: Always
+```
+
+You must provide `image`, for example `0blu/dynamic-hostport-manager:latest`.
+
+Example:
+
+``` bash
+helm upgrade --install dynamic-hostports . \
+  --namespace dynamic-hostports \
+  --create-namespace \
+  --set-string image=0blu/dynamic-hostport-manager:latest
+```
+
+To watch only one namespace:
+
+``` bash
+helm upgrade --install dynamic-hostports . \
+  --namespace dynamic-hostports \
+  --create-namespace \
+  --set-string image=0blu/dynamic-hostport-manager:latest \
+  --set watchNamespace=default
+```
+
 
 You can also build it yourself:
 

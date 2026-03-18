@@ -36,7 +36,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["endpoints", "services"]
-  verbs: ["list","create","delete"]
+  verbs: ["list","get","create","update","patch","delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -98,6 +98,6 @@ spec:
       serviceAccountName: dynamic-hostports-account
       containers:
       - name: dynamic-hostports-container
-        image: 0blu/dynamic-hostport-manager:latest
+        image: ${DYNAMIC_HOSTPORTS_IMAGE}
         imagePullPolicy: Always
       restartPolicy: Always
