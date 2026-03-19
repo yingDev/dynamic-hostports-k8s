@@ -107,6 +107,52 @@ func serviceDefinition(client *kubernetes.Clientset, meta metav1.ObjectMeta, pod
 	return serviceDef
 }
 
+func shouldRetryWithoutExternalIPs(err error) bool {
+	return apierrors.IsForbidden(err) && strings.Contains(err.Error(), "Use of external IPs is denied by admission control")
+}
+
+func createServiceAllowingExternalIPFallback(client *kubernetes.Clientset, namespace string, desired *v1.Service, pod *v1.Pod) (*v1.Service, error) {
+	newService, err := client.CoreV1().Services(namespace).Create(
+		context.Background(),
+		desired,
+		metav1.CreateOptions{},
+	)
+	if err == nil {
+		return newService, nil
+	}
+	if len(desired.Spec.ExternalIPs) == 0 || !shouldRetryWithoutExternalIPs(err) {
+		return nil, err
+	}
+
+	log.Printf("[%s] ExternalIPs are denied by cluster admission. Retrying without ExternalIPs.", pod.Name)
+	desired.Spec.ExternalIPs = nil
+	return client.CoreV1().Services(namespace).Create(
+		context.Background(),
+		desired,
+		metav1.CreateOptions{},
+	)
+}
+
+func updateServiceAllowingExternalIPFallback(client *kubernetes.Clientset, namespace string, existing *v1.Service, desired *v1.Service, pod *v1.Pod) (*v1.Service, error) {
+	existing.Labels = desired.Labels
+	existing.Spec.Type = desired.Spec.Type
+	existing.Spec.ExternalIPs = desired.Spec.ExternalIPs
+	existing.Spec.Ports[0].Port = desired.Spec.Ports[0].Port
+	existing.Spec.Ports[0].TargetPort = desired.Spec.Ports[0].TargetPort
+
+	updated, err := client.CoreV1().Services(namespace).Update(context.Background(), existing, metav1.UpdateOptions{})
+	if err == nil {
+		return updated, nil
+	}
+	if len(existing.Spec.ExternalIPs) == 0 || !shouldRetryWithoutExternalIPs(err) {
+		return nil, err
+	}
+
+	log.Printf("[%s] ExternalIPs are denied by cluster admission during update. Retrying without ExternalIPs.", pod.Name)
+	existing.Spec.ExternalIPs = nil
+	return client.CoreV1().Services(namespace).Update(context.Background(), existing, metav1.UpdateOptions{})
+}
+
 func ensureEndpoints(client *kubernetes.Clientset, meta metav1.ObjectMeta, pod *v1.Pod, requestedPort int32) error {
 	desired := endpointDefinition(meta, pod, requestedPort)
 	_, err := client.CoreV1().Endpoints(pod.Namespace).Create(
@@ -134,11 +180,7 @@ func ensureEndpoints(client *kubernetes.Clientset, meta metav1.ObjectMeta, pod *
 
 func ensureService(client *kubernetes.Clientset, meta metav1.ObjectMeta, pod *v1.Pod, requestedPort int32, cachedExternalIPs map[string]string) (*v1.Service, error) {
 	desired := serviceDefinition(client, meta, pod, requestedPort, cachedExternalIPs)
-	newService, err := client.CoreV1().Services(pod.Namespace).Create(
-		context.Background(),
-		desired,
-		metav1.CreateOptions{},
-	)
+	newService, err := createServiceAllowingExternalIPFallback(client, pod.Namespace, desired, pod)
 	if err == nil {
 		return newService, nil
 	}
@@ -154,12 +196,7 @@ func ensureService(client *kubernetes.Clientset, meta metav1.ObjectMeta, pod *v1
 		return nil, errors.New("existing service has no ports")
 	}
 
-	existing.Labels = desired.Labels
-	existing.Spec.Type = desired.Spec.Type
-	existing.Spec.ExternalIPs = desired.Spec.ExternalIPs
-	existing.Spec.Ports[0].Port = desired.Spec.Ports[0].Port
-	existing.Spec.Ports[0].TargetPort = desired.Spec.Ports[0].TargetPort
-	_, err = client.CoreV1().Services(pod.Namespace).Update(context.Background(), existing, metav1.UpdateOptions{})
+	existing, err = updateServiceAllowingExternalIPFallback(client, pod.Namespace, existing, desired, pod)
 	if err != nil {
 		return nil, err
 	}
