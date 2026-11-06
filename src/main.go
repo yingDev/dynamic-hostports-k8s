@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	logLib "log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,6 +30,16 @@ const labelKey = "dynamic-hostports"
 const managedByLabelKey = "app.kubernetes.io/managed-by"
 const managedByLabelValue = annotationPrefix
 const forPodLabelKey = "dynamic-hostports.k8s/for-pod"
+
+// Optional node annotation listing the node ports that are reachable from outside, e.g. "10450,10451" or "10450-10457".
+// When a pod's node has it, node ports are only allocated from this pool (instead of randomly by the apiserver).
+// Used by vendor-kind on vast.ai, where only the "identity" ports of the instance are forwarded (external port == internal port).
+const nodePortPoolAnnotation = annotationPrefix + "/node-port-pool"
+
+// Pods that failed to get their services (e.g. pool exhausted) are retried at this interval
+const retryInterval = 30 * time.Second
+
+var errNodePortPoolExhausted = errors.New("node port pool exhausted")
 
 var log = logLib.New(os.Stdout, "", 0)
 var logErr = logLib.New(os.Stderr, "", 0)
@@ -178,9 +190,90 @@ func ensureEndpoints(client *kubernetes.Clientset, meta metav1.ObjectMeta, pod *
 	return err
 }
 
+// Parses "10450,10451 10452-10455" into [10450 10451 10452 10453 10454 10455]
+func parsePortPool(s string) ([]int32, error) {
+	var pool []int32
+	for _, item := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' }) {
+		lo, hi := item, item
+		if i := strings.Index(item, "-"); i >= 0 {
+			lo, hi = item[:i], item[i+1:]
+		}
+		from, err1 := strconv.Atoi(lo)
+		to, err2 := strconv.Atoi(hi)
+		if err1 != nil || err2 != nil || from <= 0 || to >= 65536 || from > to {
+			return nil, fmt.Errorf("invalid port pool item %q", item)
+		}
+		for p := from; p <= to; p++ {
+			pool = append(pool, int32(p))
+		}
+	}
+	return pool, nil
+}
+
+func getNodePortPool(client *kubernetes.Clientset, nodeName string) ([]int32, error) {
+	node, err := client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return parsePortPool(node.Annotations[nodePortPoolAnnotation])
+}
+
+// Node ports are cluster wide, so every service in every namespace counts
+func usedNodePorts(client *kubernetes.Clientset) (map[int32]bool, error) {
+	services, err := client.CoreV1().Services("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	used := map[int32]bool{}
+	for _, service := range services.Items {
+		for _, port := range service.Spec.Ports {
+			if port.NodePort != 0 {
+				used[port.NodePort] = true
+			}
+		}
+	}
+	return used, nil
+}
+
+func isNodePortConflict(err error) bool {
+	return apierrors.IsInvalid(err) && strings.Contains(err.Error(), "provided port is already allocated")
+}
+
+// Creates the service with a free node port from the node's pool, or lets the apiserver pick one if the node has no pool
+func createServiceFromNodePortPool(client *kubernetes.Clientset, desired *v1.Service, pod *v1.Pod) (*v1.Service, error) {
+	pool, err := getNodePortPool(client, pod.Spec.NodeName)
+	if err != nil {
+		return nil, err
+	}
+	if len(pool) == 0 {
+		return createServiceAllowingExternalIPFallback(client, pod.Namespace, desired, pod)
+	}
+
+	used, err := usedNodePorts(client)
+	if err != nil {
+		return nil, err
+	}
+	for _, port := range pool {
+		if used[port] {
+			continue
+		}
+		desired.Spec.Ports[0].NodePort = port
+		newService, err := createServiceAllowingExternalIPFallback(client, pod.Namespace, desired, pod)
+		if err == nil {
+			log.Printf("[%s] Allocated node port %d from the pool of node '%s'", pod.Name, port, pod.Spec.NodeName)
+			return newService, nil
+		}
+		if isNodePortConflict(err) {
+			continue // taken in the meantime
+		}
+		return nil, err // includes AlreadyExists, handled by the caller
+	}
+	return nil, fmt.Errorf("%w: node '%s' has %d ports, all in use", errNodePortPoolExhausted, pod.Spec.NodeName, len(pool))
+}
+
 func ensureService(client *kubernetes.Clientset, meta metav1.ObjectMeta, pod *v1.Pod, requestedPort int32, cachedExternalIPs map[string]string) (*v1.Service, error) {
 	desired := serviceDefinition(client, meta, pod, requestedPort, cachedExternalIPs)
-	newService, err := createServiceAllowingExternalIPFallback(client, pod.Namespace, desired, pod)
+	newService, err := createServiceFromNodePortPool(client, desired, pod)
 	if err == nil {
 		return newService, nil
 	}
@@ -369,9 +462,36 @@ func handlePodEvent(client *kubernetes.Clientset, eventType watch.EventType, pod
 	return nil
 }
 
+// Retries pods whose services could not be created; a pod may not get another event for a long time
+// (e.g. it waits for a pool port that is freed when another pod is deleted)
+func retryFailedPods(client *kubernetes.Clientset, failedPods map[string]*v1.Pod, handledPods map[string]bool, cachedExternalIPs map[string]string) {
+	for key, old := range failedPods {
+		// List instead of Get: the ClusterRole only grants list/watch/patch on pods
+		pods, err := client.CoreV1().Pods(old.Namespace).List(context.Background(), metav1.ListOptions{
+			FieldSelector: "metadata.name=" + old.Name,
+		})
+		if err != nil {
+			logErr.Printf("[%s] Failed to get pod for retry %s", old.Name, err)
+			continue
+		}
+		if len(pods.Items) == 0 {
+			delete(failedPods, key)
+			continue
+		}
+		pod := &pods.Items[0]
+		if err := handlePodEvent(client, watch.Modified, pod, handledPods, cachedExternalIPs); err != nil {
+			logErr.Printf("[%s] Retry failed %s", pod.Name, err)
+			continue
+		}
+		delete(failedPods, key)
+	}
+}
+
 func podManagerRoutine(client *kubernetes.Clientset, namespace string) {
 	cachedExternalIPs := make(map[string]string)
 	handledPods := make(map[string]bool)
+	failedPods := make(map[string]*v1.Pod)
+	retryTicker := time.NewTicker(retryInterval)
 
 	timeout := int64(60 * 60 * 24) // 24 hours
 	log.Print("Watching pods")
@@ -384,14 +504,33 @@ func podManagerRoutine(client *kubernetes.Clientset, namespace string) {
 			logErr.Panicf("Error while create watch for pods %s", err)
 		}
 		eventChannel := watcher.ResultChan()
-		for event := range eventChannel {
-			pod, ok := event.Object.(*v1.Pod)
-			if !ok {
-				logErr.Panic("Unexpected watch object")
-			}
-			err := handlePodEvent(client, event.Type, pod, handledPods, cachedExternalIPs)
-			if err != nil {
-				logErr.Printf("[%s] Failed to handle event %s", pod.Name, err)
+	events:
+		for {
+			select {
+			case event, open := <-eventChannel:
+				if !open {
+					break events
+				}
+				pod, ok := event.Object.(*v1.Pod)
+				if !ok {
+					logErr.Panic("Unexpected watch object")
+				}
+				key := pod.Namespace + "/" + pod.Name
+				err := handlePodEvent(client, event.Type, pod, handledPods, cachedExternalIPs)
+				if err != nil {
+					logErr.Printf("[%s] Failed to handle event %s", pod.Name, err)
+				}
+				if err != nil && event.Type != watch.Deleted {
+					failedPods[key] = pod
+				} else {
+					delete(failedPods, key)
+				}
+				// A deleted pod frees its node ports, give waiting pods a chance right away
+				if event.Type == watch.Deleted && err == nil {
+					retryFailedPods(client, failedPods, handledPods, cachedExternalIPs)
+				}
+			case <-retryTicker.C:
+				retryFailedPods(client, failedPods, handledPods, cachedExternalIPs)
 			}
 		}
 		log.Print("Restart loop")
